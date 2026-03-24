@@ -10,7 +10,7 @@ import random
 import re
 import time
 from datetime import datetime
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -24,7 +24,7 @@ from ...core.register import (
     RegistrationResult,
 )
 from ...services import EmailServiceFactory, EmailServiceType
-from ...services.base import EmailProviderBackoffState, OTPTimeoutEmailServiceError
+from ...services.base import BaseEmailService, EmailProviderBackoffState, OTPTimeoutEmailServiceError
 from ...config.settings import get_settings
 from ..task_manager import task_manager
 
@@ -136,6 +136,13 @@ class BatchRegistrationRequest(BaseModel):
     tm_service_ids: List[int] = []
 
 
+class MockRegistrationCreateRequest(BaseModel):
+    """创建受控模拟任务请求"""
+    email_service_type: str = "tempmail"
+    start_delay_ms: int = Field(default=300, ge=0, le=5000)
+    log_delay_ms: int = Field(default=250, ge=0, le=5000)
+
+
 class RegistrationTaskResponse(BaseModel):
     """注册任务响应"""
     id: int
@@ -159,6 +166,13 @@ class BatchRegistrationResponse(BaseModel):
     batch_id: str
     count: int
     tasks: List[RegistrationTaskResponse]
+
+
+class MockRegistrationTaskCreateResponse(BaseModel):
+    """受控模拟任务响应"""
+    task: RegistrationTaskResponse
+    batch_id: str
+    checks: Dict[str, Any]
 
 
 class TaskListResponse(BaseModel):
@@ -230,6 +244,19 @@ def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
         started_at=task.started_at.isoformat() if task.started_at else None,
         completed_at=task.completed_at.isoformat() if task.completed_at else None,
     )
+
+
+def _create_task_status_callback(task_uuid: str, email_service: str):
+    """把引擎内部阶段进度映射到 TaskManager 状态广播。"""
+
+    def callback(payload: Dict[str, Any]) -> None:
+        status_payload = {
+            "email_service": email_service,
+            **payload,
+        }
+        task_manager.update_status(task_uuid, "running", **status_payload)
+
+    return callback
 
 
 def _normalize_email_service_config(
@@ -329,6 +356,7 @@ def _run_registration_engine_attempt(
     actual_proxy_url: Optional[str],
     log_callback,
     db_service,
+    status_callback=None,
 ):
     """执行单次注册引擎尝试，并在同一临界区内维护邮箱服务退避状态。"""
     provider_backoff_before_run = EmailProviderBackoffState()
@@ -343,6 +371,7 @@ def _run_registration_engine_attempt(
             email_service=email_service,
             proxy_url=actual_proxy_url,
             callback_logger=log_callback,
+            status_callback=status_callback,
             task_uuid=task_uuid,
         )
 
@@ -570,6 +599,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         crud.update_registration_task(db, task_uuid, email_service_id=None)
 
                     task_manager.update_status(task_uuid, "running", email_service=active_service_type.value)
+                    status_callback = _create_task_status_callback(task_uuid, active_service_type.value)
                     email_service = EmailServiceFactory.create(
                         selected_service_type,
                         candidate_config,
@@ -587,6 +617,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         actual_proxy_url=actual_proxy_url,
                         log_callback=log_callback,
                         db_service=db_service,
+                        status_callback=status_callback,
                     )
 
                     if result.success:
@@ -856,6 +887,275 @@ def _make_batch_helpers(batch_id: str):
     return add_batch_log, update_batch_status
 
 
+class _MockBackoffEmailService(BaseEmailService):
+    """用于真实服务验证的最小邮箱服务桩。"""
+
+    def __init__(self):
+        super().__init__(service_type=EmailServiceType.DUCK_MAIL, name="mock-backoff-service")
+
+    def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
+        return {"email": "mock@example.test", "service_id": "mock-service-id"}
+
+    def get_verification_code(
+        self,
+        email: str,
+        email_id: str = None,
+        timeout: int = 120,
+        pattern: str = r"(?<!\d)(\d{6})(?!\d)",
+        otp_sent_at: Optional[float] = None,
+    ) -> Optional[str]:
+        return None
+
+    def list_emails(self, **kwargs) -> List[Dict[str, Any]]:
+        return []
+
+    def delete_email(self, email_id: str) -> bool:
+        return True
+
+    def check_health(self) -> bool:
+        return True
+
+
+def _create_persisted_log_callback(task_uuid: str, prefix: str = "", batch_id: str = ""):
+    """同时写入内存日志队列、批量日志通道和数据库任务日志。"""
+
+    def callback(message: str) -> None:
+        full_message = f"{prefix} {message}" if prefix else message
+        task_manager.add_log(task_uuid, full_message)
+        if batch_id:
+            task_manager.add_batch_log(batch_id, full_message)
+        with get_db() as db:
+            crud.append_task_log(db, task_uuid, full_message)
+
+    return callback
+
+
+def _simulate_batch_counter_probe(batch_id: str) -> Dict[str, Any]:
+    """构造一个可重复的批量计数场景，验证 TaskManager 计数收口。"""
+    task_uuids = [str(uuid.uuid4()) for _ in range(3)]
+    task_statuses = ["completed", "failed", "completed"]
+    _init_batch_state(batch_id, task_uuids)
+    add_batch_log, update_batch_status = _make_batch_helpers(batch_id)
+    add_batch_log(f"[系统] 模拟批量任务启动，总任务: {len(task_uuids)}")
+
+    with get_db() as db:
+        for index, (task_uuid, status) in enumerate(zip(task_uuids, task_statuses), start=1):
+            crud.create_registration_task(db, task_uuid=task_uuid, proxy=None)
+            error_message = None if status == "completed" else f"mock-batch-error-{index}"
+            crud.update_registration_task(
+                db,
+                task_uuid,
+                status=status,
+                started_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+                error_message=error_message,
+            )
+
+            batch_snapshot = _get_batch_snapshot(batch_id) or {}
+            new_completed = batch_snapshot.get("completed", 0) + 1
+            new_success = batch_snapshot.get("success", 0)
+            new_failed = batch_snapshot.get("failed", 0)
+            if status == "completed":
+                new_success += 1
+                add_batch_log(f"[任务{index}] [成功] 模拟注册成功")
+            else:
+                new_failed += 1
+                add_batch_log(f"[任务{index}] [失败] 模拟注册失败: {error_message}")
+            update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
+
+    batch_snapshot = _get_batch_snapshot(batch_id) or {}
+    add_batch_log(
+        f"[完成] 批量任务完成！成功: {batch_snapshot.get('success', 0)}, "
+        f"失败: {batch_snapshot.get('failed', 0)}"
+    )
+    update_batch_status(finished=True, status="completed")
+    return {
+        "batch_id": batch_id,
+        "task_uuids": task_uuids,
+        "snapshot": task_manager.get_batch_status(batch_id) or {},
+    }
+
+
+async def run_mock_registration_task(
+    task_uuid: str,
+    batch_id: str,
+    checks: Dict[str, Any],
+    email_service_type: str,
+    start_delay_ms: int,
+    log_delay_ms: int,
+) -> None:
+    """通过真实服务链路执行可重复的模拟任务。"""
+    if start_delay_ms > 0:
+        await asyncio.sleep(start_delay_ms / 1000)
+
+    loop = task_manager.get_loop()
+    if loop is None:
+        loop = asyncio.get_event_loop()
+        task_manager.set_loop(loop)
+
+    log_callback = _create_persisted_log_callback(task_uuid)
+    delay_seconds = max(log_delay_ms, 0) / 1000
+
+    try:
+        with get_db() as db:
+            task = crud.update_registration_task(
+                db,
+                task_uuid,
+                status="running",
+                started_at=datetime.utcnow(),
+            )
+        if not task:
+            logger.error(f"模拟任务不存在: {task_uuid}")
+            return
+
+        task_manager.update_status(task_uuid, "running", email_service=email_service_type)
+        log_callback("[模拟] 任务已启动，开始执行真实链路探针")
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+
+        with get_db() as db:
+            seeded_account = crud.create_account(
+                db,
+                email=checks["seeded_account_email"],
+                email_service="tempmail",
+                access_token="mock-access-token-seeded",
+                refresh_token="mock-refresh-token-seeded",
+            )
+            tokenless_account = crud.create_account(
+                db,
+                email=checks["tokenless_account_email"],
+                email_service="tempmail",
+            )
+            crud.update_account(
+                db,
+                tokenless_account.id,
+                access_token="mock-access-token-updated",
+            )
+            partial_account = crud.create_account(
+                db,
+                email=checks["partial_account_email"],
+                email_service="tempmail",
+                access_token="mock-access-token-partial",
+                refresh_token="mock-refresh-token-partial",
+            )
+            crud.update_account(
+                db,
+                partial_account.id,
+                refresh_token="",
+            )
+            outlook_service = crud.create_email_service(
+                db,
+                service_type="outlook",
+                name=f"mock-outlook-{task_uuid[:8]}",
+                config={
+                    "accounts": [
+                        {"email": "first@example.test", "refresh_token": "old-first"},
+                        {
+                            "email": checks["outlook_account_email"],
+                            "refresh_token": "old-second",
+                        },
+                    ]
+                },
+            )
+            crud.update_outlook_refresh_token(
+                db,
+                service_id=outlook_service.id,
+                email=checks["outlook_account_email"],
+                new_refresh_token="new-second",
+            )
+            backoff_service = crud.create_email_service(
+                db,
+                service_type="duck_mail",
+                name=checks["backoff_service_name"],
+                config={
+                    "base_url": "https://mail.example.test",
+                    "default_domain": "example.test",
+                },
+            )
+            checks["seeded_account_id"] = seeded_account.id
+            checks["tokenless_account_id"] = tokenless_account.id
+            checks["partial_account_id"] = partial_account.id
+            checks["outlook_service_id"] = outlook_service.id
+            checks["backoff_service_id"] = backoff_service.id
+        log_callback("[模拟] Token 同步与 Outlook refresh_token 探针已写入数据库")
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+
+        mock_email_service = _MockBackoffEmailService()
+        backoff_states = []
+        for attempt in range(1, 4):
+            previous_state = _get_email_service_backoff_state(backoff_service.id)
+            current_state = _record_email_service_timeout_backoff(
+                backoff_service.id,
+                mock_email_service,
+                previous_state,
+                ERROR_OTP_TIMEOUT_SECONDARY,
+                f"模拟 OTP 超时 #{attempt}",
+            )
+            if current_state is not None:
+                backoff_states.append(current_state.to_dict())
+                log_callback(
+                    f"[模拟] OTP 超时退避 #{attempt}: "
+                    f"failures={current_state.failures}, delay={current_state.delay_seconds}"
+                )
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+
+        batch_probe = _simulate_batch_counter_probe(batch_id)
+        log_callback("[模拟] 批量计数探针已完成")
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+
+        result = {
+            "email": checks["seeded_account_email"],
+            "email_service": email_service_type,
+            "hardening_checks": {
+                "token_sync": {
+                    "seeded_account_id": checks["seeded_account_id"],
+                    "tokenless_account_id": checks["tokenless_account_id"],
+                    "partial_account_id": checks["partial_account_id"],
+                },
+                "outlook_refresh": {
+                    "service_id": checks["outlook_service_id"],
+                    "email": checks["outlook_account_email"],
+                },
+                "batch_counter": batch_probe,
+                "otp_timeout_backoff": {
+                    "service_id": checks["backoff_service_id"],
+                    "states": backoff_states,
+                },
+            },
+        }
+
+        with get_db() as db:
+            crud.update_registration_task(
+                db,
+                task_uuid,
+                status="completed",
+                completed_at=datetime.utcnow(),
+                result=result,
+            )
+        task_manager.update_status(
+            task_uuid,
+            "completed",
+            email=checks["seeded_account_email"],
+            email_service=email_service_type,
+        )
+        log_callback("[模拟] 任务完成，所有探针已收口")
+    except Exception as exc:
+        logger.exception("模拟任务执行失败: %s", task_uuid)
+        with get_db() as db:
+            crud.update_registration_task(
+                db,
+                task_uuid,
+                status="failed",
+                completed_at=datetime.utcnow(),
+                error_message=str(exc),
+            )
+        task_manager.update_status(task_uuid, "failed", error=str(exc), email_service=email_service_type)
+        log_callback(f"[模拟] 任务失败: {exc}")
+
+
 async def run_batch_parallel(
     batch_id: str,
     task_uuids: List[str],
@@ -1054,6 +1354,55 @@ async def run_batch_registration(
 
 
 # ============== API Endpoints ==============
+
+@router.post("/create", response_model=MockRegistrationTaskCreateResponse)
+async def create_mock_registration(
+    request: MockRegistrationCreateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """创建用于端到端验证的受控模拟任务。"""
+    try:
+        EmailServiceType(request.email_service_type)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效的邮箱服务类型: {request.email_service_type}"
+        )
+
+    task_uuid = str(uuid.uuid4())
+    suffix = task_uuid[:8]
+    batch_id = str(uuid.uuid4())
+    checks: Dict[str, Any] = {
+        "seeded_account_email": f"mock-seeded-{suffix}@example.test",
+        "tokenless_account_email": f"mock-tokenless-{suffix}@example.test",
+        "partial_account_email": f"mock-partial-{suffix}@example.test",
+        "outlook_account_email": f"mock-outlook-{suffix}@example.test",
+        "backoff_service_name": f"mock-backoff-{suffix}",
+    }
+
+    with get_db() as db:
+        task = crud.create_registration_task(
+            db,
+            task_uuid=task_uuid,
+            proxy=None,
+        )
+
+    background_tasks.add_task(
+        run_mock_registration_task,
+        task_uuid,
+        batch_id,
+        checks,
+        request.email_service_type,
+        request.start_delay_ms,
+        request.log_delay_ms,
+    )
+
+    return MockRegistrationTaskCreateResponse(
+        task=task_to_response(task),
+        batch_id=batch_id,
+        checks=checks,
+    )
+
 
 @router.post("/start", response_model=RegistrationTaskResponse)
 async def start_registration(

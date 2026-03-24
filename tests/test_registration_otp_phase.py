@@ -26,6 +26,36 @@ class FakeEmailService:
         return self.code
 
 
+class FakeCookies:
+    def __init__(self, values):
+        self.values = values
+
+    def get(self, name):
+        return self.values.get(name)
+
+
+class FakeSession:
+    def __init__(self, cookies=None):
+        self.cookies = FakeCookies(cookies or {})
+        self.get_calls = []
+
+    def get(self, *args, **kwargs):
+        self.get_calls.append((args, kwargs))
+        raise AssertionError("unexpected network call")
+
+
+class FakeResponse:
+    def __init__(self, *, url="", text="", json_payload=None):
+        self.url = url
+        self.text = text
+        self._json_payload = json_payload
+
+    def json(self):
+        if isinstance(self._json_payload, Exception):
+            raise self._json_payload
+        return self._json_payload
+
+
 def _build_engine(monkeypatch, email_service):
     monkeypatch.setattr(register_module, "get_settings", lambda: DummySettings())
     return RegistrationEngine(email_service=email_service)
@@ -103,3 +133,42 @@ def test_advance_login_authorization_sets_otp_anchor_before_password_submit(monk
     assert callback_url is None
     assert engine._otp_sent_at == 456.0
     assert seen_anchors == [456.0, 456.0]
+
+
+def test_get_device_id_reuses_existing_cookie_without_extra_request(monkeypatch):
+    email_service = FakeEmailService(code=None)
+    engine = _build_engine(monkeypatch, email_service)
+    engine.oauth_start = type("OAuthStart", (), {"auth_url": "https://auth.example.test/authorize"})()
+    engine.session = FakeSession(cookies={"oai-did": "did-cached"})
+
+    assert engine._get_device_id() == "did-cached"
+    assert engine.session.get_calls == []
+
+
+def test_extract_workspace_id_from_response_payload(monkeypatch):
+    email_service = FakeEmailService(code=None)
+    engine = _build_engine(monkeypatch, email_service)
+    response = FakeResponse(
+        url="https://auth.example.test/consent?workspace_id=ws-url",
+        json_payload={
+            "page": {
+                "workspace": {
+                    "id": "ws-json",
+                }
+            }
+        },
+    )
+
+    assert engine._extract_workspace_id_from_response(response=response) == "ws-json"
+
+
+def test_extract_workspace_id_from_response_text_when_hidden_input_missing(monkeypatch):
+    email_service = FakeEmailService(code=None)
+    engine = _build_engine(monkeypatch, email_service)
+    response = FakeResponse(
+        url="https://auth.example.test/consent",
+        text='<script>window.__NEXT_DATA__={"activeWorkspaceId":"ws-script"}</script>',
+        json_payload=ValueError("not json"),
+    )
+
+    assert engine._extract_workspace_id_from_response(response=response) == "ws-script"
