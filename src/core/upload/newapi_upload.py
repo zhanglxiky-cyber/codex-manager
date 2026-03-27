@@ -37,11 +37,24 @@ def normalize_authorization_token(header_value: str, header_name: str = "Authori
 
 
 def _mask_header_value(header_value: str, keep: int = 4) -> str:
-    if len(header_value) <= keep * 2:
-        return "*" * len(header_value)
-    return f"{header_value[:keep]}...{header_value[-keep:]}"
+    """
+    Mask a sensitive header value for safe logging.
 
+    The strategy is:
+    - If the value is empty, return an empty string.
+    - If the length is <= keep, fully mask it (no characters revealed).
+    - Otherwise, reveal only the last `keep` characters and mask the rest.
+    """
+    if not header_value:
+        return ""
 
+    length = len(header_value)
+    if length <= keep:
+        return "*" * length
+
+    masked_prefix = "*" * (length - keep)
+    visible_suffix = header_value[-keep:]
+    return masked_prefix + visible_suffix
 def _build_headers(api_key: str) -> dict:
     safe_api_key = normalize_authorization_token(api_key)
     return {
